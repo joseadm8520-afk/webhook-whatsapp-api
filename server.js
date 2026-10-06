@@ -9,7 +9,8 @@ function loadConfig() {
   return {
     port: Number(process.env.PORT || 3000),
     verifyToken: process.env.VERIFY_TOKEN || '',
-    appSecret: process.env.APP_SECRET || ''
+    appSecret: process.env.APP_SECRET || '',
+    makeWebhookUrl: process.env.MAKE_WEBHOOK_URL || ''
   };
 }
 
@@ -57,6 +58,28 @@ function readBody(request) {
   });
 }
 
+async function forwardMessage(message, makeWebhookUrl) {
+  if (!makeWebhookUrl) {
+    throw new Error('MAKE_WEBHOOK_URL is not configured');
+  }
+
+  const response = await fetch(makeWebhookUrl, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      from: message.from,
+      messageId: message.id || '',
+      type: message.type || '',
+      text: message.text?.body || ''
+    }),
+    signal: AbortSignal.timeout(10_000)
+  });
+
+  if (!response.ok) {
+    throw new Error(`Make webhook returned HTTP ${response.status}`);
+  }
+}
+
 function createServer(config = loadConfig()) {
   return http.createServer(async (request, response) => {
     const url = new URL(request.url || '/', 'http://localhost');
@@ -96,7 +119,29 @@ function createServer(config = loadConfig()) {
           return sendJson(response, 400, { error: 'Invalid WhatsApp webhook payload' });
         }
 
-        console.log(`WhatsApp webhook received (${event.entry.length} entries)`);
+        const messages = event.entry.flatMap((entry) => (
+          Array.isArray(entry.changes)
+            ? entry.changes.flatMap((change) => (
+              Array.isArray(change.value?.messages) ? change.value.messages : []
+            ))
+            : []
+        ));
+
+        for (const message of messages) {
+          if (typeof message.from !== 'string' || message.from.length === 0) {
+            console.warn('WhatsApp message without sender was not forwarded');
+            continue;
+          }
+
+          try {
+            await forwardMessage(message, config.makeWebhookUrl);
+          } catch (error) {
+            console.error(`Could not forward WhatsApp message to Make: ${error.message}`);
+            return sendJson(response, 502, { error: 'Could not forward WhatsApp message' });
+          }
+        }
+
+        console.log(`WhatsApp webhook received (${messages.length} messages)`);
         return sendJson(response, 200, { status: 'received' });
       } catch (error) {
         const statusCode = error.statusCode || 400;

@@ -2,6 +2,7 @@
 
 const assert = require('node:assert/strict');
 const crypto = require('node:crypto');
+const http = require('node:http');
 const { afterEach, test } = require('node:test');
 const { createServer } = require('../server');
 
@@ -17,6 +18,22 @@ async function startServer(config) {
   servers.add(server);
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   return `http://127.0.0.1:${server.address().port}`;
+}
+
+async function startReceiver(handler) {
+  const server = http.createServer(handler);
+  servers.add(server);
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  return `http://127.0.0.1:${server.address().port}`;
+}
+
+function signedPayload(body, appSecret) {
+  const rawBody = JSON.stringify(body);
+  const signature = `sha256=${crypto.createHmac('sha256', appSecret).update(rawBody).digest('hex')}`;
+  return {
+    headers: { 'content-type': 'application/json', 'x-hub-signature-256': signature },
+    body: rawBody
+  };
 }
 
 test('health endpoint reports that the service is running', async () => {
@@ -61,6 +78,71 @@ test('webhook accepts a correctly signed WhatsApp event', async () => {
   });
   assert.equal(response.status, 200);
   assert.deepEqual(await response.json(), { status: 'received' });
+});
+
+test('webhook forwards each incoming message to Make without forwarding status updates', async () => {
+  const appSecret = 'test-app-secret';
+  const forwarded = [];
+  const makeWebhookUrl = await startReceiver(async (request, response) => {
+    const chunks = [];
+    for await (const chunk of request) chunks.push(chunk);
+    forwarded.push(JSON.parse(Buffer.concat(chunks).toString('utf8')));
+    response.writeHead(200);
+    response.end();
+  });
+  const baseUrl = await startServer({ appSecret, makeWebhookUrl });
+  const event = {
+    object: 'whatsapp_business_account',
+    entry: [{
+      changes: [{
+        value: {
+          messages: [{
+            from: '15551234567',
+            id: 'wamid.test',
+            type: 'text',
+            text: { body: 'Prueba' }
+          }],
+          statuses: [{ id: 'wamid.delivery', status: 'delivered' }]
+        }
+      }]
+    }]
+  };
+  const response = await fetch(`${baseUrl}/webhook`, {
+    method: 'POST',
+    ...signedPayload(event, appSecret)
+  });
+
+  assert.equal(response.status, 200);
+  assert.deepEqual(forwarded, [{
+    from: '15551234567',
+    messageId: 'wamid.test',
+    type: 'text',
+    text: 'Prueba'
+  }]);
+});
+
+test('webhook reports a forwarding failure so Meta can retry the event', async () => {
+  const appSecret = 'test-app-secret';
+  const makeWebhookUrl = await startReceiver((_request, response) => {
+    response.writeHead(503);
+    response.end();
+  });
+  const baseUrl = await startServer({ appSecret, makeWebhookUrl });
+  const event = {
+    object: 'whatsapp_business_account',
+    entry: [{
+      changes: [{
+        value: { messages: [{ from: '15551234567', type: 'text', text: { body: 'Prueba' } }] }
+      }]
+    }]
+  };
+  const response = await fetch(`${baseUrl}/webhook`, {
+    method: 'POST',
+    ...signedPayload(event, appSecret)
+  });
+
+  assert.equal(response.status, 502);
+  assert.deepEqual(await response.json(), { error: 'Could not forward WhatsApp message' });
 });
 
 test('webhook rejects an invalid signature', async () => {
